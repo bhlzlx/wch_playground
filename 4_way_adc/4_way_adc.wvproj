@@ -10,10 +10,14 @@
 			"rtos": "NoneOS",
 			"mcu": "CH582M",
 			"description": "Website: https://www.wch.cn/products/CH583.html?\\nROM(byte): 448K, SRAM(byte): 32K, CHIP PINS: 48, GPIO PORTS: 40.\\nCH583 is a 32-bit RISC microcontroller integrating ble wireless communication. On chip integrated 2Mbps lower-power Bluetooth ble communication module 2 full speed USB hosts and device controllers and transceivers, 2SPIs, 4 serial ports, ADC touch key detection module, RTC and other rich peripheral resources.",
+			"tempratureScope": "",
+			"artifactType": "executable",
 			"link": "WCH-Link",
 			"peripheral_version": "2.4",
 			"calibrateSupport": false,
+			"calibrateCommand": "",
 			"UIConfigSupport": false,
+			"UIConfigCommand": "",
 			"externalFlashSupport": false
 		},
 		"linkedFolders": [],
@@ -44,9 +48,6 @@
 				"post_script": "",
 				"post_script_description": "",
 				"excludeResources": [
-					"${project}/StdPeriphDriver/CH58x_usbhostClass.c",
-					"${project}/StdPeriphDriver/CH58x_usbhostBase.c",
-					"${project}/StdPeriphDriver/CH58x_usbdev.c",
 					"${project}/StdPeriphDriver/CH58x_uart3.c",
 					"${project}/StdPeriphDriver/CH58x_uart2.c",
 					"${project}/StdPeriphDriver/CH58x_timer3.c",
@@ -423,7 +424,7 @@
 			"showDebugOutputTimestamps": true
 		},
 		"reserve": {
-			"PROGRAM_NAME": "obj\\4_way_adc.elf",
+			"PROGRAM_NAME": "obj/4_way_adc.elf",
 			"PROJECT_ATTR": "4_way_adc",
 			"PROJECT_BUILD_CONFIG_AUTO_ATTR": true,
 			"PROJECT_BUILD_CONFIG_ID_ATTR": "",

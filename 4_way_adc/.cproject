@@ -274,7 +274,7 @@
             </toolChain>
           </folderInfo>
           <sourceEntries>
-            <entry excluding="StdPeriphDriver/CH58x_usbhostClass.c|StdPeriphDriver/CH58x_usbhostBase.c|StdPeriphDriver/CH58x_usbdev.c|StdPeriphDriver/CH58x_uart3.c|StdPeriphDriver/CH58x_uart2.c|StdPeriphDriver/CH58x_timer3.c|StdPeriphDriver/CH58x_timer2.c|StdPeriphDriver/CH58x_timer1.c|StdPeriphDriver/CH58x_timer0.c|StdPeriphDriver/CH58x_spi0.c|StdPeriphDriver/CH58x_pwm.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
+            <entry excluding="StdPeriphDriver/CH58x_uart3.c|StdPeriphDriver/CH58x_uart2.c|StdPeriphDriver/CH58x_timer3.c|StdPeriphDriver/CH58x_timer2.c|StdPeriphDriver/CH58x_timer1.c|StdPeriphDriver/CH58x_timer0.c|StdPeriphDriver/CH58x_spi0.c|StdPeriphDriver/CH58x_pwm.c" flags="VALUE_WORKSPACE_PATH|RESOLVED" kind="sourcePath" name=""/>
           </sourceEntries>
         </configuration>
       </storageModule>

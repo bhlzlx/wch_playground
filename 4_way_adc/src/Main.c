@@ -1,26 +1,21 @@
 /********************************** (C) COPYRIGHT *******************************
  * File Name          : Main.c
  * Author             : WCH
- * Version            : V1.0
+ * Version            : V1.1
  * Date               : 2020/08/06
- * Description        : 4路ADC摇杆示例
+ * Description        : XInput 摇杆: 4路 ADC 方向检测 → USB XInput 报告
  *********************************************************************************
  * Copyright (c) 2021 Nanjing Qinheng Microelectronics Co., Ltd.
- * Attention: This software (modified or not) and binary are used for
- * microcontroller manufactured by Nanjing Qinheng Microelectronics.
  *******************************************************************************/
 
-/* ----- 库配置 (必须在 #include "adc_joystick.h" 之前) ----- */
-#define AJ_CHANGE_ONLY  1   /* 仅方向变化时打印 */
-
 #include "CH58x_common.h"
-#include "adc_joystick.h"
+#include "usb_xinput.h"
 #include <stdio.h>
 
 int main()
 {
     char    buf[64];
-    uint8_t prev = 0xFF;
+    uint8_t seq = 0;
 
     SetSysClock(CLK_SOURCE_PLL_60MHz);
 
@@ -30,30 +25,44 @@ int main()
     GPIOA_ModeCfg(GPIO_Pin_9, GPIO_ModeOut_PP_5mA);
     UART1_DefInit();
 
-    AJ_UART_SEND("CH582M 4-Ch ADC Joystick\r\n", 26);
+    AJ_UART_SEND("XInput joystick (ADC)\r\n", 22);
 
-    /* 初始化 + 校准 */
+    /* ADC 摇杆初始化 + 校准 */
     AJ_Init();
     AJ_Calibrate();
 
-    /* 主循环 */
+    /* USB XInput 初始化 + 等待握手 */
+    InitUSBXinput();
+    mDelaymS(1000);
+
+    /* 主循环: 读取摇杆 → 发送 USB 报告 */
+    AJ_Direction prev = AJ_DIR_N;
+
     while(1)
     {
         uint16_t mv[4];
         AJ_Direction dir = AJ_Read(mv);
 
-#if AJ_CHANGE_ONLY
-        if(dir == prev) { mDelaymS(50); continue; }
-        prev = dir;
-#endif
+        /* 方向变化时发送报告 (AJ_CHANGE_ONLY 默认开启) */
+        if(dir != prev)
+        {
+            prev = dir;
+            seq++;
 
-        uint8_t len = sprintf(buf, "%s:%04umV %s:%04umV %s:%04umV %s:%04umV | %s\r\n",
-                              AJ_ChNames[0], mv[0],
-                              AJ_ChNames[1], mv[1],
-                              AJ_ChNames[2], mv[2],
-                              AJ_ChNames[3], mv[3],
-                              AJ_DirName(dir));
-        AJ_UART_SEND(buf, len);
-        mDelaymS(50);
+            /* 构建并发送 USB 报告 */
+            ReportDataXinput report;
+            AJ_BuildXInputReport(dir, &report);
+            SendUSBXinputReport(&report);
+
+            /* 串口打印 */
+            uint8_t len = sprintf(buf,
+                "[%02u] %s lx:%+6d ly:%+6d  | %s:%4u %s:%4u %s:%4u %s:%4u mV\r\n",
+                seq, AJ_DirName(dir), report.l_x, report.l_y,
+                AJ_ChNames[0], mv[0], AJ_ChNames[1], mv[1],
+                AJ_ChNames[2], mv[2], AJ_ChNames[3], mv[3]);
+            AJ_UART_SEND(buf, len);
+        }
+
+        mDelaymS(10);
     }
 }
