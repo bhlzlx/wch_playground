@@ -47,6 +47,14 @@ extern "C" {
 #define PS4_FEATURES_SIZE       32
 #define PS4_CONFIG_DESC_SIZE    41
 
+/* Byte extraction from 16-bit values */
+#ifndef LOBYTE
+#define LOBYTE(w)  ((uint8_t)((uint16_t)(w) & 0xFF))
+#endif
+#ifndef HIBYTE
+#define HIBYTE(w)  ((uint8_t)(((uint16_t)(w)) >> 8))
+#endif
+
 /*******************************************************************************
  * HID Report Constants
  ******************************************************************************/

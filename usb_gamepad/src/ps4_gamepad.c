@@ -86,7 +86,7 @@ static const uint8_t ps4_config_desc[] = {
     /* Endpoint Descriptor (OUT) */
     7,                              /* bLength */
     5,                              /* bDescriptorType (ENDPOINT) */
-    0x02,                           /* bEndpointAddress (EP2 OUT) */
+    0x01,                           /* bEndpointAddress (EP1 OUT) */
     0x03,                           /* bmAttributes (Interrupt) */
     PS4_ENDPOINT_SIZE, 0x00,        /* wMaxPacketSize (64) */
     1                               /* bInterval (1ms) */
@@ -276,74 +276,43 @@ PS4_AuthData          g_ps4Auth;
  * USB State Tracking
  ******************************************************************************/
 
-/* Control transfer state machine */
-typedef enum {
-    CTL_IDLE = 0,              /* No pending control transfer */
-    CTL_SETUP_RECVD,           /* SETUP received, waiting for data phase */
-    CTL_DATA_OUT_RECVD,        /* OUT data received, waiting for status IN */
-    CTL_STATUS_SENT,           /* Status IN sent, transfer complete */
-    CTL_STALL                  /* Stall the endpoint */
-} ControlTransferState;
-
-static ControlTransferState s_ctlState = CTL_IDLE;
-
-/* Saved SET_REPORT parameters to process when data arrives */
-static uint8_t  s_pendingReportType = 0;
-static uint8_t  s_pendingReportId   = 0;
-static uint16_t s_pendingReportLen  = 0;
-
-/* Feature report buffer for GET_REPORT responses */
-static uint8_t s_featureBuf[64];
-
-/* USB state */
+/* WCH-pattern USB state variables (used by USB_DevTransProcess) */
 static uint8_t  s_usbConfigured    = 0;
 static uint8_t  s_reportCounter    = 0;
-static uint32_t s_lastSendTime     = 0;
-static uint8_t  s_lastReport[64]   = {0};
-static uint8_t  s_reportPending    = 0;
+static uint8_t  DevConfig       = 0;
+static uint8_t  Ready           = 0;
+static uint8_t  SetupReqCode;
+static uint16_t SetupReqLen;
+static const uint8_t *pDescr;
+static uint8_t  USB_SleepStatus = 0;
 
-/* Current controller type */
+/* Saved SET_REPORT parameters for OUT data phase */
+static uint8_t  s_pendingReportType = 0;
+static uint8_t  s_pendingReportId   = 0;
+
+/* Controller type */
 static PS4ControllerType s_ctrlType = PS4_CT_ARCADESTICK;
 
 /*******************************************************************************
- * USB Low-Level Helpers
+ * USB Standard Request Constants (not in CH58x headers)
  ******************************************************************************/
-
-/* Begin an EP0 IN data phase (for GET_DESCRIPTOR, GET_REPORT, etc.) */
-static void USB_EP0_IN_Send(const uint8_t *data, uint8_t len)
-{
-    if (len > PS4_ENDPOINT0_SIZE) len = PS4_ENDPOINT0_SIZE;
-    if (len > 0) {
-        memcpy(pEP0_DataBuf, data, len);
-    }
-    R8_UEP0_T_LEN = len;
-    R8_UEP0_CTRL = (R8_UEP0_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
-    s_ctlState = CTL_STATUS_SENT;
-}
-
-/* Stall EP0 */
-static void USB_EP0_Stall(void)
-{
-    R8_UEP0_CTRL = (R8_UEP0_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_STALL;
-    s_ctlState = CTL_STALL;
-}
-
-/* Complete status stage (zero-length IN) */
-static void USB_EP0_StatusIN(void)
-{
-    R8_UEP0_T_LEN = 0;
-    R8_UEP0_CTRL = (R8_UEP0_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
-    s_ctlState = CTL_STATUS_SENT;
-}
-
-/* Prepare EP1 IN for sending a HID report */
-static void USB_EP1_IN_Send(const uint8_t *data, uint8_t len)
-{
-    if (len > PS4_ENDPOINT_SIZE) len = PS4_ENDPOINT_SIZE;
-    memcpy(pEP1_IN_DataBuf, data, len);
-    R8_UEP1_T_LEN = len;
-    R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_ACK;
-}
+#define USB_GET_DESCRIPTOR    0x06
+#define USB_SET_ADDRESS       0x05
+#define USB_SET_CONFIGURATION 0x09
+#define USB_GET_CONFIGURATION 0x08
+#define USB_SET_FEATURE       0x03
+#define USB_CLEAR_FEATURE     0x01
+#define USB_GET_STATUS        0x00
+#define USB_GET_INTERFACE     0x0A
+#define USB_SET_INTERFACE     0x0B
+#define USB_DESCR_TYP_HID      0x21
+#define USB_DESCR_TYP_REPORT   0x22
+#define USB_REQ_TYP_MASK       0x60
+#define USB_REQ_TYP_STANDARD   0x00
+#define USB_REQ_RECIP_MASK     0x1F
+#define USB_REQ_RECIP_DEVICE   0x00
+#define USB_REQ_RECIP_ENDP     0x02
+#define DEF_USB_GET_REPORT     0x01  /* missing from CH58x_usbdev.h */
 
 /*******************************************************************************
  * CRC32 Calculation (for auth packets)
@@ -365,313 +334,261 @@ static uint32_t CRC32_Calculate(const uint8_t *data, uint32_t len)
 }
 
 /*******************************************************************************
- * USB Descriptor Handling
+ * ProcessSetReportData — Handle SET_REPORT data from EP0 OUT phase
  ******************************************************************************/
-
-static void USB_HandleGetDescriptor(uint8_t descType, uint8_t descIndex)
+static void ProcessSetReportData(const uint8_t *buf, uint16_t len)
 {
-    switch (descType) {
-    case 1: /* DEVICE Descriptor */
-        USB_EP0_IN_Send(ps4_device_desc, sizeof(ps4_device_desc));
-        break;
-    case 2: /* CONFIGURATION Descriptor */
-        /* Update HID descriptor length embedded in config descriptor */
-        {
-            uint8_t configBuf[sizeof(ps4_config_desc)];
-            memcpy(configBuf, ps4_config_desc, sizeof(ps4_config_desc));
-            /* HID descriptor report length at offset 25-26 in config */
-            uint16_t reportLen = sizeof(ps4_report_desc);
-            configBuf[25] = (uint8_t)(reportLen & 0xFF);
-            configBuf[26] = (uint8_t)(reportLen >> 8);
-            USB_EP0_IN_Send(configBuf, sizeof(configBuf));
-        }
-        break;
-    case 3: /* STRING Descriptor */
-        switch (descIndex) {
-        case 0:
-            USB_EP0_IN_Send(ps4_string_lang, sizeof(ps4_string_lang));
-            break;
-        case 1: { /* Manufacturer */
-            uint8_t buf[64];
-            uint8_t len = (uint8_t)strlen((const char *)ps4_string_manuf);
-            buf[0] = (uint8_t)(len * 2 + 2);
-            buf[1] = 3;
-            for (uint8_t i = 0; i < len; i++) {
-                buf[2 + i * 2] = ps4_string_manuf[i];
-                buf[3 + i * 2] = 0;
-            }
-            USB_EP0_IN_Send(buf, len * 2 + 2);
-            break;
-        }
-        case 2: { /* Product */
-            uint8_t buf[64];
-            uint8_t len = (uint8_t)strlen((const char *)ps4_string_product);
-            buf[0] = (uint8_t)(len * 2 + 2);
-            buf[1] = 3;
-            for (uint8_t i = 0; i < len; i++) {
-                buf[2 + i * 2] = ps4_string_product[i];
-                buf[3 + i * 2] = 0;
-            }
-            USB_EP0_IN_Send(buf, len * 2 + 2);
-            break;
-        }
-        default:
-            USB_EP0_Stall();
-            break;
-        }
-        break;
-    case 0x22: /* HID Report Descriptor */
-        USB_EP0_IN_Send(ps4_report_desc, sizeof(ps4_report_desc));
-        break;
-    default:
-        USB_EP0_Stall();
-        break;
-    }
-}
-
-/*******************************************************************************
- * Feature Report Handling
- ******************************************************************************/
-
-/* Handle GET_REPORT (Host reads feature/input report) */
-static void USB_HandleGetReport(uint8_t reportType, uint8_t reportId)
-{
-    memset(s_featureBuf, 0, sizeof(s_featureBuf));
-    uint16_t len = 0;
-    
-    if (reportType == 1) { /* Input Report */
-        memcpy(s_featureBuf, &g_ps4Report, sizeof(g_ps4Report));
-        len = sizeof(g_ps4Report);
-    } else if (reportType == 3) { /* Feature Report */
-        switch (reportId) {
-        case PS4_AUTH_GET_CALIBRATION:
-            memcpy(s_featureBuf, ps4_calibration, sizeof(ps4_calibration));
-            len = sizeof(ps4_calibration);
-            break;
-        case PS4_AUTH_DEFINITION:
-            memcpy(s_featureBuf, &g_ps4Config, sizeof(g_ps4Config));
-            len = sizeof(g_ps4Config);
-            break;
-        case PS4_AUTH_GET_MAC_ADDRESS:
-            memcpy(s_featureBuf, ps4_mac_addr, sizeof(ps4_mac_addr));
-            len = sizeof(ps4_mac_addr);
-            break;
-        case PS4_AUTH_GET_VERSION_DATE:
-            memcpy(s_featureBuf, ps4_version, sizeof(ps4_version));
-            len = sizeof(ps4_version);
-            break;
-        case PS4_AUTH_GET_SIGNATURE_NONCE:
-            /* Return chunk of auth data */
-            {
-                uint8_t data[64];
-                data[0] = 0xF1;
-                data[1] = g_ps4Auth.nonce_id;
-                data[2] = 0;  /* chunk index */
-                data[3] = 0;
-                memcpy(&data[4], &g_ps4Auth.auth_buffer[0], 56);
-                uint32_t crc = CRC32_Calculate(data, 60);
-                memcpy(&data[60], &crc, 4);
-                memcpy(s_featureBuf, &data[1], 63);
-                len = 63;
-            }
-            break;
-        case PS4_AUTH_GET_SIGNING_STATE:
-            {
-                uint8_t data[16];
-                data[0] = 0xF2;
-                data[1] = g_ps4Auth.nonce_id;
-                data[2] = 16;  /* 0=ready, 16=not ready (no auth key) */
-                memset(&data[3], 0, 9);
-                uint32_t crc = CRC32_Calculate(data, 12);
-                memcpy(&data[12], &crc, 4);
-                memcpy(s_featureBuf, &data[1], 15);
-                len = 15;
-            }
-            break;
-        case PS4_AUTH_RESET_AUTH:
-            memcpy(s_featureBuf, ps4_auth_reset, sizeof(ps4_auth_reset));
-            len = sizeof(ps4_auth_reset);
-            g_ps4Auth.auth_state = 0;
-            break;
-        default:
-            break;
-        }
-    }
-    
-    if (len > 0) {
-        USB_EP0_IN_Send(s_featureBuf, (uint8_t)len);
-    } else {
-        USB_EP0_Stall();
-    }
-}
-
-/*******************************************************************************
- * USB HID Class Request Handler
- ******************************************************************************/
-
-static uint8_t USB_HandleHIDClassRequest(PUSB_SETUP_REQ pSetup)
-{
-    uint8_t bmRequestType = pSetup->bRequestType;
-    uint8_t bRequest = pSetup->bRequest;
-    uint16_t wValue = pSetup->wValue;
-    uint16_t wLength = pSetup->wLength;
-    
-    /* HID interface is index 0. Check that the request targets an interface. */
-    if ((bmRequestType & 0x03) != 0x01) {
-        return 0; /* Not interface-targeted */
-    }
-    
-    if ((bmRequestType & 0x80) == 0x00) {
-        /* Host-to-Device */
-        switch (bRequest) {
-        case 0x09: /* SET_REPORT */
-            /* Data comes in OUT phase — save params for later processing */
-            s_pendingReportType = HIBYTE(wValue);
-            s_pendingReportId   = LOBYTE(wValue);
-            s_pendingReportLen  = wLength;
-            s_ctlState = CTL_SETUP_RECVD;
-            /* Keep EP0 OUT ACK to receive the data, do NOT send status yet */
-            return 1;
-        case 0x0A: /* SET_IDLE */
-            USB_EP0_StatusIN();
-            return 1;
-        case 0x0B: /* SET_PROTOCOL */
-            USB_EP0_StatusIN();
-            return 1;
-        default:
-            break;
-        }
-    } else {
-        /* Device-to-Host */
-        switch (bRequest) {
-        case 0x01: /* GET_REPORT */
-            /* Data goes out immediately in IN phase */
-            USB_HandleGetReport(HIBYTE(wValue), LOBYTE(wValue));
-            return 1;
-        case 0x02: /* GET_IDLE */
-            USB_EP0_IN_Send((const uint8_t *)"\x00", 1);
-            return 1;
-        case 0x03: /* GET_PROTOCOL */
-            USB_EP0_IN_Send((const uint8_t *)"\x00", 1);
-            return 1;
-        default:
-            break;
-        }
-    }
-    
-    return 0; /* Not handled */
-}
-
-/*******************************************************************************
- * USB Setup Packet Handler
- * 
- * Called from the ISR when a SETUP token is received on EP0.
- * For Host-to-Device requests with data (SET_REPORT), we only record the
- * parameters here. The actual data processing happens in the ISR's
- * OUT phase handler, after the data has been received.
- ******************************************************************************/
-
-void PS4_USB_SetupHandler(void)
-{
-    PUSB_SETUP_REQ pSetup = pSetupReqPak;
-    uint8_t bmRequestType = pSetup->bRequestType;
-    uint8_t bRequest = pSetup->bRequest;
-    
-    /* Reset control transfer state */
-    s_ctlState = CTL_IDLE;
-    memset(s_featureBuf, 0, sizeof(s_featureBuf));
-    
-    if ((bmRequestType & 0x60) == 0x00) {
-        /* === Standard Device Request === */
-        switch (bRequest) {
-        case 0x00: /* GET_STATUS (Device) */
-            s_featureBuf[0] = 0x00; /* Bus-powered, no remote wakeup */
-            s_featureBuf[1] = 0x00;
-            USB_EP0_IN_Send(s_featureBuf, 2);
-            break;
-        case 0x01: /* CLEAR_FEATURE */
-        case 0x03: /* SET_FEATURE */
-            USB_EP0_StatusIN();
-            break;
-        case 0x05: /* SET_ADDRESS */
-            /* CH582M hardware handles address latching. 
-             * Do NOT send status — hardware does it after the IN phase. */
-            s_ctlState = CTL_SETUP_RECVD;
-            break;
-        case 0x06: /* GET_DESCRIPTOR */
-            USB_HandleGetDescriptor(HIBYTE(pSetup->wValue), LOBYTE(pSetup->wValue));
-            break;
-        case 0x08: /* GET_CONFIGURATION */
-            s_featureBuf[0] = s_usbConfigured ? 1 : 0;
-            USB_EP0_IN_Send(s_featureBuf, 1);
-            break;
-        case 0x09: /* SET_CONFIGURATION */
-            s_usbConfigured = (LOBYTE(pSetup->wValue) != 0) ? 1 : 0;
-            if (s_usbConfigured) {
-                /* Configure HID endpoints when configuration is set */
-                R8_UEP1_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK | RB_UEP_AUTO_TOG;
-                R8_UEP2_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK | RB_UEP_AUTO_TOG;
-            }
-            USB_EP0_StatusIN();
-            break;
-        default:
-            goto stall;
-        }
-    } else if ((bmRequestType & 0x60) == 0x20) {
-        /* === Class Request (HID) === */
-        if (!USB_HandleHIDClassRequest(pSetup)) {
-            goto stall;
-        }
-    } else if ((bmRequestType & 0x60) == 0x40) {
-        /* === Vendor Request === */
-        goto stall;
-    } else {
-        goto stall;
-    }
-    return;
-    
-stall:
-    USB_EP0_Stall();
-}
-
-/*******************************************************************************
- * Process deferred SET_REPORT data (called from ISR OUT phase)
- ******************************************************************************/
-
-static void USB_ProcessSetReport(void)
-{
-    const uint8_t *buf = pEP0_DataBuf;
-    uint16_t len = s_pendingReportLen;
-    
-    if (s_pendingReportType == 2) { /* Output Report */
-        if (s_pendingReportId == 0x05) {
-            memcpy(&g_ps4Features, buf,
-                   len < sizeof(g_ps4Features) ? len : sizeof(g_ps4Features));
-        }
-    } else if (s_pendingReportType == 3) { /* Feature Report */
+    if (s_pendingReportType == 2) {
+        if (s_pendingReportId == 0x05)
+            memcpy(&g_ps4Features, buf, len < sizeof(g_ps4Features) ? len : sizeof(g_ps4Features));
+    } else if (s_pendingReportType == 3) {
         if (s_pendingReportId == PS4_AUTH_SET_AUTH_PAYLOAD) {
-            /* PS4 sends nonce in 63-byte SET_REPORT (Feature):
-             * buf[0] = nonce_id
-             * buf[1] = nonce_page (0-4)
-             * buf[2] = 0
-             * buf[3..58] = data (56 bytes for pages 0-3, 32 bytes for page 4)
-             * buf[59..62] = CRC32
-             */
-            uint8_t nonceId   = buf[0];
-            uint8_t noncePage = buf[1];
-            
-            if (noncePage < 4) {
-                memcpy(&g_ps4Auth.auth_buffer[noncePage * 56], &buf[3], 56);
-            } else if (noncePage == 4) {
-                memcpy(&g_ps4Auth.auth_buffer[noncePage * 56], &buf[3], 32);
-                g_ps4Auth.nonce_id = nonceId;
-                g_ps4Auth.auth_state = 1;
+            uint8_t nid = buf[0], npg = buf[1];
+            if (npg < 4)
+                memcpy(&g_ps4Auth.auth_buffer[npg*56], &buf[3], 56);
+            else if (npg == 4) {
+                memcpy(&g_ps4Auth.auth_buffer[npg*56], &buf[3], 32);
+                g_ps4Auth.nonce_id = nid; g_ps4Auth.auth_state = 1;
             }
         }
     }
-    
-    /* Complete the control transfer with a zero-length status IN */
-    USB_EP0_StatusIN();
+}
+
+/*******************************************************************************
+ * PrepareGetReport — Build feature report response in pEP0_DataBuf
+ ******************************************************************************/
+static uint8_t PrepareGetReport(uint8_t reportType, uint8_t reportId)
+{
+    if (reportType == 1) {
+        memcpy(pEP0_DataBuf, &g_ps4Report, sizeof(g_ps4Report));
+        return sizeof(g_ps4Report);
+    }
+    if (reportType != 3) return 0;
+
+    switch (reportId) {
+    case PS4_AUTH_GET_CALIBRATION:
+        memcpy(pEP0_DataBuf, ps4_calibration, sizeof(ps4_calibration));
+        return sizeof(ps4_calibration);
+    case PS4_AUTH_DEFINITION:
+        memcpy(pEP0_DataBuf, &g_ps4Config, sizeof(g_ps4Config));
+        return sizeof(g_ps4Config);
+    case PS4_AUTH_GET_MAC_ADDRESS:
+        memcpy(pEP0_DataBuf, ps4_mac_addr, sizeof(ps4_mac_addr));
+        return sizeof(ps4_mac_addr);
+    case PS4_AUTH_GET_VERSION_DATE:
+        memcpy(pEP0_DataBuf, ps4_version, sizeof(ps4_version));
+        return sizeof(ps4_version);
+    case PS4_AUTH_GET_SIGNATURE_NONCE: {
+        uint8_t d[64];
+        d[0]=0xF1; d[1]=g_ps4Auth.nonce_id; d[2]=0; d[3]=0;
+        memcpy(&d[4], g_ps4Auth.auth_buffer, 56);
+        uint32_t crc = CRC32_Calculate(d, 60);
+        memcpy(&d[60], &crc, 4);
+        memcpy(pEP0_DataBuf, &d[1], 63);
+        return 63;
+    }
+    case PS4_AUTH_GET_SIGNING_STATE: {
+        uint8_t d[16];
+        d[0]=0xF2; d[1]=g_ps4Auth.nonce_id; d[2]=16;
+        memset(&d[3],0,9);
+        uint32_t crc = CRC32_Calculate(d,12);
+        memcpy(&d[12],&crc,4);
+        memcpy(pEP0_DataBuf,&d[1],15);
+        return 15;
+    }
+    case PS4_AUTH_RESET_AUTH:
+        memcpy(pEP0_DataBuf, ps4_auth_reset, sizeof(ps4_auth_reset));
+        g_ps4Auth.auth_state = 0;
+        return sizeof(ps4_auth_reset);
+    default: return 0;
+    }
+}
+
+/*******************************************************************************
+ * USB_DevTransProcess — Core USB handler (WCH official pattern)
+ ******************************************************************************/
+
+#define DevEP0SIZE  0x40
+
+void USB_DevTransProcess(void)
+{
+    uint16_t len;       /* MUST be uint16_t — report descriptor is 321 bytes */
+    uint8_t chtype;
+    uint8_t intflag, errflag = 0;
+
+    intflag = R8_USB_INT_FG;
+
+    if (intflag & RB_UIF_TRANSFER)
+    {
+        if ((R8_USB_INT_ST & MASK_UIS_TOKEN) != MASK_UIS_TOKEN)
+        {
+            switch (R8_USB_INT_ST & (MASK_UIS_TOKEN | MASK_UIS_ENDP))
+            {
+            case UIS_TOKEN_IN:  /* EP0 IN */
+                switch (SetupReqCode) {
+                case USB_GET_DESCRIPTOR:
+                    len = SetupReqLen >= DevEP0SIZE ? DevEP0SIZE : SetupReqLen;
+                    memcpy(pEP0_DataBuf, pDescr, len);
+                    SetupReqLen -= len; pDescr += len;
+                    R8_UEP0_T_LEN = (uint8_t)len;
+                    R8_UEP0_CTRL ^= RB_UEP_T_TOG;
+                    break;
+                case USB_SET_ADDRESS:
+                    R8_USB_DEV_AD = (R8_USB_DEV_AD & RB_UDA_GP_BIT) | SetupReqLen;
+                    R8_UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
+                    break;
+                default:
+                    R8_UEP0_T_LEN = 0;
+                    R8_UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
+                    Ready = 1;
+                    break;
+                }
+                break;
+
+            case UIS_TOKEN_OUT:  /* EP0 OUT (SET_REPORT data) */
+                len = R8_USB_RX_LEN;
+                if (SetupReqCode == DEF_USB_SET_REPORT) {
+                    ProcessSetReportData(pEP0_DataBuf, len);
+                }
+                R8_UEP0_T_LEN = 0;
+                R8_UEP0_CTRL = UEP_R_RES_ACK | UEP_T_RES_NAK;
+                break;
+
+            case UIS_TOKEN_OUT | 1:  /* EP1 OUT (output report) */
+                if (R8_USB_INT_ST & RB_UIS_TOG_OK) {
+                    R8_UEP1_CTRL ^= RB_UEP_R_TOG;
+                    len = R8_USB_RX_LEN;
+                    if (len >= sizeof(PS4_OutputReport))
+                        memcpy(&g_ps4Features, pEP1_OUT_DataBuf, sizeof(PS4_OutputReport));
+                }
+                break;
+
+            case UIS_TOKEN_IN | 1:  /* EP1 IN done — ready for next */
+                R8_UEP1_CTRL ^= RB_UEP_T_TOG;
+                R8_UEP1_CTRL = (R8_UEP1_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
+                Ready = 1;
+                break;
+            }
+            R8_USB_INT_FG = RB_UIF_TRANSFER;
+        }
+
+        if (R8_USB_INT_ST & RB_UIS_SETUP_ACT)
+        {
+            R8_UEP0_CTRL = RB_UEP_R_TOG | RB_UEP_T_TOG | UEP_R_RES_ACK | UEP_T_RES_NAK;
+            SetupReqLen  = pSetupReqPak->wLength;
+            SetupReqCode = pSetupReqPak->bRequest;
+            chtype       = pSetupReqPak->bRequestType;
+            len = 0; errflag = 0;
+
+            if ((pSetupReqPak->bRequestType & USB_REQ_TYP_MASK) != USB_REQ_TYP_STANDARD) {
+                if (pSetupReqPak->bRequestType & 0x20) {
+                    switch (SetupReqCode) {
+                    case DEF_USB_GET_IDLE:    pEP0_DataBuf[0]=0; len=1; break;
+                    case DEF_USB_SET_IDLE:    break;
+                    case DEF_USB_SET_REPORT:
+                        s_pendingReportType = (uint8_t)(pSetupReqPak->wValue>>8);
+                        s_pendingReportId   = (uint8_t)(pSetupReqPak->wValue);
+                        break;
+                    case DEF_USB_SET_PROTOCOL: break;
+                    case DEF_USB_GET_PROTOCOL: pEP0_DataBuf[0]=0; len=1; break;
+                    case DEF_USB_GET_REPORT:
+                        len = PrepareGetReport((uint8_t)(pSetupReqPak->wValue>>8),
+                                               (uint8_t)(pSetupReqPak->wValue));
+                        break;
+                    default: errflag=0xFF; break;
+                    }
+                }
+            } else {
+                switch (SetupReqCode) {
+                case USB_GET_DESCRIPTOR:
+                    switch ((pSetupReqPak->wValue)>>8) {
+                    case USB_DESCR_TYP_DEVICE: pDescr=ps4_device_desc; len=ps4_device_desc[0]; break;
+                    case USB_DESCR_TYP_CONFIG: {
+                        static uint8_t c[sizeof(ps4_config_desc)];
+                        memcpy(c,ps4_config_desc,sizeof(ps4_config_desc));
+                        uint16_t rl=sizeof(ps4_report_desc);
+                        c[25]=(uint8_t)rl; c[26]=(uint8_t)(rl>>8);
+                        pDescr=c; len=c[2];
+                    } break;
+                    case USB_DESCR_TYP_HID: pDescr=(uint8_t*)(&ps4_config_desc[18]); len=9; break;
+                    case USB_DESCR_TYP_REPORT: pDescr=ps4_report_desc; len=sizeof(ps4_report_desc); break;
+                    case USB_DESCR_TYP_STRING:
+                        switch((pSetupReqPak->wValue)&0xFF) {
+                        case 0: pDescr=ps4_string_lang; len=ps4_string_lang[0]; break;
+                        case 1: {
+                            static uint8_t b[64]; uint8_t sl=(uint8_t)strlen((const char*)ps4_string_manuf);
+                            b[0]=sl*2+2; b[1]=3;
+                            for(uint8_t i=0;i<sl;i++){b[2+i*2]=ps4_string_manuf[i];b[3+i*2]=0;}
+                            pDescr=b; len=b[0];
+                        } break;
+                        case 2: {
+                            static uint8_t b[64]; uint8_t sl=(uint8_t)strlen((const char*)ps4_string_product);
+                            b[0]=sl*2+2; b[1]=3;
+                            for(uint8_t i=0;i<sl;i++){b[2+i*2]=ps4_string_product[i];b[3+i*2]=0;}
+                            pDescr=b; len=b[0];
+                        } break;
+                        default: errflag=0xFF; break;
+                        }
+                        break;
+                    default: errflag=0xFF; break;
+                    }
+                    if(SetupReqLen>len)SetupReqLen=len;
+                    len=(SetupReqLen>=DevEP0SIZE)?DevEP0SIZE:SetupReqLen;
+                    memcpy(pEP0_DataBuf,pDescr,len); pDescr+=len;
+                    break;
+                case USB_SET_ADDRESS: SetupReqLen=(pSetupReqPak->wValue)&0xFF; break;
+                case USB_GET_CONFIGURATION: pEP0_DataBuf[0]=DevConfig; if(SetupReqLen>1)SetupReqLen=1; break;
+                case USB_SET_CONFIGURATION:
+                    DevConfig=(pSetupReqPak->wValue)&0xFF; s_usbConfigured=(DevConfig!=0);
+                    if(s_usbConfigured){
+                        R8_UEP1_CTRL=UEP_R_RES_ACK|UEP_T_RES_NAK|RB_UEP_AUTO_TOG;
+                        R8_UEP2_CTRL=UEP_R_RES_ACK|UEP_T_RES_NAK|RB_UEP_AUTO_TOG;
+                    }
+                    break;
+                case USB_CLEAR_FEATURE: case USB_SET_FEATURE:
+                    if((pSetupReqPak->bRequestType&USB_REQ_RECIP_MASK)==USB_REQ_RECIP_ENDP){
+                        switch(pSetupReqPak->wIndex&0xFF){
+                        case 0x81: R8_UEP1_CTRL=(R8_UEP1_CTRL&~(RB_UEP_T_TOG|MASK_UEP_T_RES))|UEP_T_RES_NAK; break;
+                        case 0x01: R8_UEP1_CTRL=(R8_UEP1_CTRL&~(RB_UEP_R_TOG|MASK_UEP_R_RES))|UEP_R_RES_ACK; break;
+                        default: errflag=0xFF; break;
+                        }
+                    }else if((pSetupReqPak->bRequestType&USB_REQ_RECIP_MASK)!=USB_REQ_RECIP_DEVICE)errflag=0xFF;
+                    break;
+                case USB_GET_STATUS:
+                    pEP0_DataBuf[0]=(USB_SleepStatus)?0x02:0x00; pEP0_DataBuf[1]=0;
+                    if(SetupReqLen>=2)SetupReqLen=2;
+                    break;
+                case USB_GET_INTERFACE: pEP0_DataBuf[0]=0; if(SetupReqLen>1)SetupReqLen=1; break;
+                case USB_SET_INTERFACE: break;
+                default: errflag=0xFF; break;
+                }
+            }
+
+            if(errflag==0xFF){
+                R8_UEP0_CTRL=RB_UEP_R_TOG|RB_UEP_T_TOG|UEP_R_RES_STALL|UEP_T_RES_STALL; Ready=1;
+            }else{
+                if(chtype&0x80){ len=(SetupReqLen>DevEP0SIZE)?DevEP0SIZE:SetupReqLen; SetupReqLen-=len; }
+                else len=0;
+                R8_UEP0_T_LEN=(uint8_t)len;
+                R8_UEP0_CTRL=RB_UEP_R_TOG|RB_UEP_T_TOG|UEP_R_RES_ACK|UEP_T_RES_ACK;
+            }
+            R8_USB_INT_FG=RB_UIF_TRANSFER;
+        }
+    }
+    else if(intflag&RB_UIF_BUS_RST){
+        R8_USB_DEV_AD=0;
+        R8_UEP0_CTRL=UEP_R_RES_ACK|UEP_T_RES_NAK;
+        R8_UEP1_CTRL=UEP_R_RES_ACK|UEP_T_RES_NAK;
+        R8_UEP2_CTRL=UEP_R_RES_ACK|UEP_T_RES_NAK;
+        R8_UEP3_CTRL=UEP_R_RES_ACK|UEP_T_RES_NAK;
+        s_usbConfigured=0;
+        R8_USB_INT_FG=RB_UIF_BUS_RST;
+    }
+    else if(intflag&RB_UIF_SUSPEND){
+        Ready=(R8_USB_MIS_ST&RB_UMS_SUSPEND)?0:1;
+        R8_USB_INT_FG=RB_UIF_SUSPEND;
+    }
+    else R8_USB_INT_FG=intflag;
 }
 
 /*******************************************************************************
@@ -745,9 +662,6 @@ void PS4_Init(PS4ControllerType ctrlType)
     
     /* Initialize state */
     s_reportCounter = 0;
-    s_lastSendTime  = 0;
-    s_reportPending = 0;
-    memset(s_lastReport, 0, sizeof(s_lastReport));
 }
 
 void PS4_SetButton(uint16_t mask, uint8_t pressed)
@@ -806,25 +720,14 @@ void PS4_SetTriggers(uint8_t left, uint8_t right)
 
 uint8_t PS4_SendReport(void)
 {
-    /* Only send when configured */
-    if (!s_usbConfigured) {
-        return 0;
-    }
+    if (!s_usbConfigured || !Ready) return 0;
     
-    /* Check if EP1 IN is ready (not busy from previous transfer) */
-    if (R8_UEP1_CTRL & UEP_T_RES_NAK) {
-        /* EP busy, try next time */
-        return 0;
-    }
-    
-    /* Update report counter and timing */
+    Ready = 0;
     s_reportCounter = (s_reportCounter + 1) & 0x3F;
     g_ps4Report.reportCounter = s_reportCounter;
     
-    /* Send via EP1 IN */
-    USB_EP1_IN_Send((const uint8_t *)&g_ps4Report, sizeof(g_ps4Report));
-    memcpy(s_lastReport, &g_ps4Report, sizeof(g_ps4Report));
-    
+    memcpy(pEP1_IN_DataBuf, &g_ps4Report, sizeof(g_ps4Report));
+    DevEP1_IN_Deal(sizeof(g_ps4Report));
     return 1;
 }
 
@@ -903,107 +806,17 @@ void PS4_USB_DeviceInit(void)
 /*******************************************************************************
  * USB Interrupt Handler
  * 
- * Handles all USB events:
- *   BUS_RST  — Bus reset, clear address and configuration
- *   SUSPEND   — Suspend/resume detection
- *   TRANSFER  — SETUP / IN / OUT token completion
+ * Handles USB events directly at the register level.
+ * The CH582M USB library does NOT provide a setup/transaction processor —
+ * we must handle all USB requests ourselves in this ISR.
  * 
- * Control transfer state machine (EP0):
- *   CTL_IDLE           → SETUP token: handle request
- *   CTL_SETUP_RECVD    → OUT data: process SET_REPORT data → Status IN
- *                       → IN: status stage done → CTL_IDLE
- *   CTL_STATUS_SENT    → completion
+ * This function is the single entry point for all USB interrupt handling.
+ * It follows the official WCH USB Device example pattern.
  ******************************************************************************/
 
 void PS4_USB_IRQHandler(void)
 {
-    uint8_t intFlag = R8_USB_INT_FG;
-    
-    /* --- Bus Reset --- */
-    if (intFlag & RB_UIF_BUS_RST) {
-        R8_USB_DEV_AD = 0x00;
-        s_usbConfigured = 0;
-        s_ctlState = CTL_IDLE;
-        R8_USB_INT_FG = RB_UIF_BUS_RST;
-        return; /* Bus reset re-initializes everything */
-    }
-    
-    /* --- Suspend / Resume --- */
-    if (intFlag & RB_UIF_SUSPEND) {
-        if (R8_USB_MIS_ST & RB_UMS_SUSPEND) {
-            /* Device suspended — could reduce power here */
-        } else {
-            /* Device resumed */
-        }
-        R8_USB_INT_FG = RB_UIF_SUSPEND;
-        if (intFlag == RB_UIF_SUSPEND) return;
-        intFlag &= ~RB_UIF_SUSPEND;
-    }
-    
-    /* --- Transfer Complete --- */
-    if (intFlag & RB_UIF_TRANSFER) {
-        uint8_t token    = (R8_USB_INT_ST & MASK_UIS_TOKEN);
-        uint8_t endpoint = (R8_USB_INT_ST & MASK_UIS_ENDP);
-        
-        switch (token) {
-            
-        /* ================================================================
-         * SETUP Token — EP0 only
-         * ================================================================ */
-        case UIS_TOKEN_SETUP:
-            s_ctlState = CTL_IDLE;
-            PS4_USB_SetupHandler();
-            break;
-        
-        /* ================================================================
-         * IN Token — Data or Status sent to host
-         * ================================================================ */
-        case UIS_TOKEN_IN:
-            if (endpoint == 0) {
-                /* EP0 IN complete: either data phase done or status stage done.
-                 * After sending data/status, re-enable NAK for next SETUP. */
-                R8_UEP0_CTRL = (R8_UEP0_CTRL & ~MASK_UEP_T_RES) | UEP_T_RES_NAK;
-                
-                if (s_ctlState == CTL_SETUP_RECVD) {
-                    /* SET_ADDRESS status stage done, hardware latches address now */
-                    s_ctlState = CTL_IDLE;
-                } else {
-                    s_ctlState = CTL_IDLE;
-                }
-            }
-            /* EP1/2/3 IN: auto-toggle handles handshake, keep NAK for next send */
-            break;
-        
-        /* ================================================================
-         * OUT Token — Data received from host
-         * ================================================================ */
-        case UIS_TOKEN_OUT:
-            if (endpoint == 0) {
-                /* EP0 OUT data received. 
-                 * If we were waiting for SET_REPORT data, process it now. */
-                if (s_ctlState == CTL_SETUP_RECVD) {
-                    /* Data is now in pEP0_DataBuf. Process and send status. */
-                    USB_ProcessSetReport();
-                } else {
-                    /* Unexpected OUT data — stall */
-                    USB_EP0_Stall();
-                }
-            } else if (endpoint == 2) {
-                /* EP2 OUT: Output report from host (Report ID 0x05) */
-                uint8_t len = R8_UEP2_R_LEN;
-                if (len >= sizeof(PS4_OutputReport)) {
-                    memcpy(&g_ps4Features, pEP2_OUT_DataBuf, sizeof(PS4_OutputReport));
-                }
-            }
-            /* EP1 OUT: not used for PS4 */
-            break;
-        
-        default:
-            break;
-        }
-        
-        R8_USB_INT_FG = RB_UIF_TRANSFER;
-    }
+    USB_DevTransProcess();
 }
 
 /*******************************************************************************

@@ -1,0 +1,27 @@
+{
+	"folders": [
+		{
+			"name": ".mrs",
+			"path": "."
+		},
+		{
+			"name": "usb_gamepad",
+			"path": "../../../github/usb_gamepad/usb_gamepad"
+		}
+	],
+	"settings": {
+		"mrs.workspace.type": "project",
+		"files.associations": {
+			"*.c": "c",
+			"*.h": "cpp",
+			"*.hxx": "cpp",
+			"*.hpp": "cpp",
+			"*.c++": "cpp",
+			"*.cpp": "cpp",
+			"*.cxx": "cpp",
+			"*.cc": "cpp",
+			"*.hh": "cpp",
+			"*.h++": "cpp"
+		}
+	}
+}

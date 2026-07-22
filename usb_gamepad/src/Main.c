@@ -5,16 +5,22 @@
  * Emulates a PS4-compatible HID gamepad on the CH582M.
  * 
  * GPIO Mapping (CH582M, customize for your PCB):
- *   PA0  - D-Pad Up       PA7  - Triangle
- *   PA1  - D-Pad Down     PA8  - L1
- *   PA2  - D-Pad Left     PA9  - R1
- *   PA3  - D-Pad Right    PA10 - L2
- *   PA4  - Cross (x)      PA11 - R2
- *   PA5  - Circle (o)     PA12 - Select/Share
- *   PA6  - Square ([])    PA13 - Start/Options
- *                         PA14 - L3 (Left stick)
- *                         PA15 - R3 (Right stick)
- *   PB0  - PS Home        PB1  - Touchpad
+ *   PA0  - D-Pad Up       PA12 - Select/Share
+ *   PA1  - D-Pad Down     PA13 - Start/Options
+ *   PA2  - D-Pad Left     PA14 - L3 (Left stick)
+ *   PA3  - D-Pad Right    PA15 - R3 (Right stick)
+ *   PA4  - Cross (x)      
+ *   PA5  - Circle (o)     
+ *   PA6  - Square (□)    
+ *   PA7  - Triangle (△)  
+ *   PA8  - L1             
+ *   PA9  - R1             
+ *   PA10 - L2
+ *   PA11 - R2
+ *   ⚠ PB10 = USB D- (DO NOT USE as GPIO!)
+ *   ⚠ PB11 = USB D+ (DO NOT USE as GPIO!)
+ *   PB12 - PS Home        
+ *   PB13 - Touchpad       
  * 
  * All buttons: active LOW (internal pull-up, connect to GND when pressed)
  ******************************************************************************/
@@ -23,7 +29,11 @@
 
 /* =========================================================================
  * GPIO Button Pin Definitions
+ * 
+ * USB is on PB10 (D-) and PB11 (D+) — these pins must NOT be used as GPIO.
+ * All 16 Port A pins available for buttons.
  * ========================================================================= */
+/* Port A — all 16 pins for buttons */
 #define BTN_DPAD_UP        GPIO_Pin_0
 #define BTN_DPAD_DOWN      GPIO_Pin_1
 #define BTN_DPAD_LEFT      GPIO_Pin_2
@@ -41,8 +51,9 @@
 #define BTN_L3             GPIO_Pin_14
 #define BTN_R3             GPIO_Pin_15
 
-#define BTN_HOME           GPIO_Pin_0
-#define BTN_TOUCHPAD       GPIO_Pin_1
+/* Port B — PB10/PB11 reserved for USB D-/D+, use remaining pins */
+#define BTN_HOME           GPIO_Pin_12
+#define BTN_TOUCHPAD       GPIO_Pin_13
 
 #define BTN_PORT_A_MASK    (BTN_DPAD_UP    | BTN_DPAD_DOWN  | BTN_DPAD_LEFT  | \
                             BTN_DPAD_RIGHT | BTN_CROSS      | BTN_CIRCLE     | \
@@ -52,6 +63,7 @@
                             BTN_R3)
 
 #define BTN_PORT_B_MASK    (BTN_HOME | BTN_TOUCHPAD)
+                            /* PB10, PB11 intentionally excluded! */
 
 /* =========================================================================
  * Timing
@@ -111,7 +123,7 @@ static void Read_Buttons(void)
     PS4_SetButton(PS4_MASK_PS, IS_PRESSED(portB, BTN_HOME));
     PS4_SetButton(PS4_MASK_TP, IS_PRESSED(portB, BTN_TOUCHPAD));
     
-    /* Digital triggers from L2/R2 */
+    /* Digital triggers from L2/R2 (Port A) */
     uint8_t lt = IS_PRESSED(portA, BTN_L2) ? 0xFF : 0x00;
     uint8_t rt = IS_PRESSED(portA, BTN_R2) ? 0xFF : 0x00;
     PS4_SetTriggers(lt, rt);
@@ -122,8 +134,20 @@ static void Read_Buttons(void)
  * ========================================================================= */
 int main(void)
 {
-    /* System clock: 60MHz PLL */
-    SetSysClock(CLK_SOURCE_PLL_60MHz);
+    /* System clock: 48MHz PLL (USB needs exactly 48MHz) */
+    SetSysClock(CLK_SOURCE_PLL_48MHz);
+    
+    /* Allow PLL to stabilize before USB init (critical for USB PHY) */
+    DelayMs(50);
+    
+    /* ---- Debug UART0 (PB7=TX, PB4=RX) optional ---- */
+#if 0
+    GPIOB_SetBits(GPIO_Pin_7);
+    GPIOB_ModeCfg(GPIO_Pin_4, GPIO_ModeIN_PU);
+    GPIOB_ModeCfg(GPIO_Pin_7, GPIO_ModeOut_PP_5mA);
+    UART0_DefInit();
+    UART0_SendString((uint8_t *)"PS4 Boot\r\n", 10);
+#endif
     
     /* Configure button GPIOs: input with pull-up (active LOW) */
     GPIOA_ModeCfg(BTN_PORT_A_MASK, GPIO_ModeIN_PU);
@@ -135,7 +159,7 @@ int main(void)
     /* Initialize USB device */
     PS4_USB_DeviceInit();
     
-    /* Enable USB interrupt */
+    /* Enable USB interrupt (after everything is initialized) */
     PFIC_EnableIRQ(USB_IRQn);
     
     /* Main loop */
@@ -143,7 +167,6 @@ int main(void)
     {
         Read_Buttons();                  /* Read physical inputs */
         PS4_SendReport();                /* Send HID report via USB */
-        PS4_USB_DevTransProcess();       /* USB background processing */
         DelayMs(MAIN_LOOP_DELAY_MS);     /* 1ms loop timing */
     }
 }
